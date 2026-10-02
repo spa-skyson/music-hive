@@ -1,0 +1,30 @@
+# Dev-override: файл валиден и standalone (worker/player имеют build — issue #3),
+# основное применение — вместе с базовым:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+#
+# Player: go run на bind-mount источника; worker: тот же образ, что в проде,
+# но ./src смонтирован поверх (/app/src, editable-install) — правки Python
+# подхватываются без пересборки.
+services:
+  player:
+    build:
+      context: .
+      dockerfile: Dockerfile.player.dev
+    working_dir: /workspace/player
+    command: ["go", "run", "./cmd/music-hive-player"]
+    volumes:
+      - ./player:/workspace/player
+      - music-hive-go-build:/root/.cache/go-build
+      - music-hive-go-mod:/go/pkg/mod
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    volumes:
+      - ./src:/app/src:ro
+
+volumes:
+  music-hive-go-build:
+  music-hive-go-mod:

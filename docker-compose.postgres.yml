@@ -1,0 +1,17 @@
+# Dev-only overlay: публикует порт postgres основного стека на localhost —
+# psql / migrate-sqlite / pg_dump с хоста. Образ, креды и healthcheck живут
+# в docker-compose.yml; файл ничего не дублирует.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d
+#   DSN с хоста: postgres://music_hive:music_hive@127.0.0.1:${MUSIC_HIVE_PG_PORT:-5432}/music_hive?sslmode=disable
+#
+# Дефолт 5432; если на хосте уже есть свой PG — переопределите MUSIC_HIVE_PG_PORT
+# (внутри docker-сети сервис всегда доступен как postgres:5432, порт в DSN не входит).
+#
+# Ранее этот файл поднимал отдельный standalone-PG (проект music-hive-postgres).
+# Теперь postgres — часть основного стека; старый проект и его volume можно удалить:
+#   docker compose -p music-hive-postgres down -v
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:${MUSIC_HIVE_PG_PORT:-5432}:5432"

@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1.7
+# Python worker (scan / CLAP embed / jobs) — internal only
+FROM python:3.12-slim-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg libsndfile1 \
+  && rm -rf /var/lib/apt/lists/*
+# Packaging-tooling CVE fix-up (audit 2026-09-26), all preinstalled in
+# python:3.12-slim and none pinned in pyproject.toml dependencies:
+#   - jaraco.context CVE-2026-23949 (path traversal), fix >=6.1.0
+#   - setuptools  CVE-2025-47273 (PackageIndex path traversal), fix >=78.1.1
+#   - wheel       CVE-2026-24049 (privesc via malicious wheel), fix >=0.46.2
+# Must stay BEFORE the torch index layer below so later pip runs cannot
+# downgrade the fixed versions back to the base-image ones.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --upgrade "jaraco.context>=6.1.0" "setuptools>=78.1.1" "wheel>=0.46.2"
+WORKDIR /app
+COPY pyproject.toml README.md ./
+# Dependencies are intentionally installed before source code is copied.
+# A normal code-only rebuild therefore reuses this expensive layer.
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --index-url "${TORCH_INDEX_URL}" "torch>=2.2.0"
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -c 'import subprocess, sys, tomllib; dependencies = tomllib.load(open("pyproject.toml", "rb"))["project"]["dependencies"]; dependencies = [item for item in dependencies if not item.lower().startswith("torch")]; subprocess.check_call([sys.executable, "-m", "pip", "install", *dependencies])'
+COPY src ./src
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-deps -e .
+ENV MUSIC_HIVE_LIBRARY=/music \
+    MUSIC_HIVE_DATA_DIR=/data \
+    MUSIC_HIVE_ARTWORK_CACHE=/data/cache/artwork \
+    MUSIC_HIVE_WORKER_ADDR=0.0.0.0:8790 \
+    MUSIC_HIVE_PLAYER_RELOAD_URL=http://player:8787/api/reload \
+    MUSIC_HIVE_ROOT=/app
+# Do not EXPOSE publicly in compose — only on internal network
+VOLUME ["/data", "/music"]
+CMD ["music-hive", "worker"]

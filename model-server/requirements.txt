@@ -1,0 +1,10 @@
+# model-server (#32): зависимости inference-сервиса CLAP + MuQ-MuLan.
+#
+# ВАЖНО: torch/torchaudio ставятся ОТДЕЛЬНО и РАНЬШЕ этого файла из CPU-индекса
+# (см. Dockerfile, ARG TORCH_INDEX_URL) — muq тянет torch как зависимость, и без
+# пина pip скачает CUDA-сборку (~2.5 ГБ) на CPU-VM.
+fastapi>=0.115
+uvicorn[standard]>=0.30
+numpy>=2.0
+transformers>=4.40
+muq>=0.1.0

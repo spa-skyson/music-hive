@@ -1,0 +1,72 @@
+# PostgreSQL + pgvector — единственное хранилище; схема — goose
+# (`music-hive-player migrate`), см. docs/DEPLOY.md.
+#
+# Порт postgres наружу не публикуется (только docker-сеть). Dev-исключение —
+# docker-compose.postgres.yml (localhost-порт для psql/дампов).
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: music_hive
+      POSTGRES_PASSWORD: ${MUSIC_HIVE_PG_PASSWORD:-music_hive}
+      POSTGRES_DB: music_hive
+    volumes:
+      - music-hive-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  player:
+    build:
+      context: .
+      dockerfile: Dockerfile.player
+    ports:
+      - "8787:8787"
+    env_file: .env
+    environment:
+      # Полный DSN можно перекрыть (внешний PG): MUSIC_HIVE_DATABASE_URL в .env.
+      MUSIC_HIVE_DATABASE_URL: ${MUSIC_HIVE_DATABASE_URL:-postgres://music_hive:${MUSIC_HIVE_PG_PASSWORD:-music_hive}@postgres:5432/music_hive?sslmode=disable}
+      MUSIC_HIVE_LIBRARY: /music
+      MUSIC_HIVE_WORKER_URL: http://worker:8790
+      MUSIC_HIVE_WORKER_AUTOSTART: "0"
+      MUSIC_HIVE_PLAYER_ADDR: ":8787"
+    volumes:
+      - music-hive-data:/data
+      - ${MUSIC_HIVE_LIBRARY:-./data/music}:/music
+    depends_on:
+      worker:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    env_file: .env
+    environment:
+      MUSIC_HIVE_DATABASE_URL: ${MUSIC_HIVE_DATABASE_URL:-postgres://music_hive:${MUSIC_HIVE_PG_PASSWORD:-music_hive}@postgres:5432/music_hive?sslmode=disable}
+      MUSIC_HIVE_LIBRARY: /music
+      MUSIC_HIVE_DATA_DIR: /data
+      MUSIC_HIVE_ARTWORK_CACHE: /data/cache/artwork
+      MUSIC_HIVE_WORKER_ADDR: 0.0.0.0:8790
+      # Явно: image-default есть, но reload-notify должен таргетить compose-сеть
+      # (на интеграционной приёмке уезжал в дефолт 127.0.0.1).
+      MUSIC_HIVE_PLAYER_RELOAD_URL: http://player:8787/api/reload
+      MUSIC_HIVE_NIGHTLY_MIXES_TIMEZONE: ${MUSIC_HIVE_NIGHTLY_MIXES_TIMEZONE:-UTC}
+    volumes:
+      - music-hive-data:/data
+      - ${MUSIC_HIVE_LIBRARY:-./data/music}:/music:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # no ports: — internal only
+    restart: unless-stopped
+
+volumes:
+  music-hive-data:
+  music-hive-pgdata:

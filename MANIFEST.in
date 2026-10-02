@@ -1,0 +1,2 @@
+# F4.2: конфиги ONNX-энкодеров в sdist (веса *.onnx — локальный экспорт)
+recursive-include models.d *.json *.md

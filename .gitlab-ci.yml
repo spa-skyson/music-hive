@@ -1,0 +1,504 @@
+# GitLab CI/CD для music-hive (self-hosted GitLab).
+#
+# Executor: docker. Jobs build/publish требуют privileged runner (docker:dind).
+# Требования к runner'у — см. README-отчёт ветки chore/gitlab-ci / docs DEPLOY.
+#
+# Registry: Harbor cr.home.fwz.ru (не GitLab registry). Доступ:
+#   1) интеграция проекта с Harbor (GitLab >= 17.2, robot-gitlab) — экспортирует
+#      HARBOR_*: HARBOR_URL / HARBOR_HOST (bare host, без схемы) / HARBOR_OCI /
+#      HARBOR_PROJECT / HARBOR_USERNAME / HARBOR_PASSWORD;
+#   2) fallback — protected-переменные CUSTOM_REGISTRY / CUSTOM_REGISTRY_USER /
+#      CUSTOM_REGISTRY_PASSWORD / CUSTOM_IMAGE_REPO (полный оверлей).
+#
+# Базовые образы — из dockerhub-зеркала Harbor (cr.home.fwz.ru/dockerhub/...).
+# docker:27-dind запинен по digest (verified в инфре; у digest-pinned сервиса
+# ОБЯЗАТЕЛЕН alias: docker, иначе DOCKER_HOST не резолвится). Остальные —
+# по тегам: digest-pin после первой проверки в инфре.
+#
+# Стадии: verify -> test -> build -> scan -> publish.
+#   MR-пайплайны:      verify + test            (быстрый фидбек, без docker build)
+#   main:              verify + test + build + scan, publish — ВРУЧНУЮ
+#   тег vX.Y.Z:        всё, publish — АВТОМАТОМ (релизная сборка)
+#
+# Теги образов (по git-workflow проекта):
+#   main  -> v<X.Y.Z>-<N>  (X.Y.Z из git describe / pyproject, N = CI_PIPELINE_IID)
+#   тег   -> vX.Y.Z        (финальный образ)
+# Сборки всегда пушатся под иммутабельный тег $CI_COMMIT_SHA,
+# publish лишь навешивает версионный тег на просканированный образ.
+
+workflow:
+  rules:
+    # MR-пайплайн вместо branch-пайплайна — нет дублей для веток с открытым MR.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+
+stages:
+  - verify
+  - test
+  - build
+  - scan
+  - publish
+
+default:
+  interruptible: true
+  # Раннер зарегистрирован с тегом main и берёт только tagged jobs —
+  # вешаем тег на все джобы через default (переопределений tags нет).
+  tags: [main]
+
+variables:
+  # PLAYER_IMAGE/WORKER_IMAGE считаются в script-времени (см. .harbor-login):
+  # HARBOR_* экспортируются интеграцией только в рантайме джобы.
+  # Индекс PyTorch для сборки worker (CPU-колёса; переопределяется переменной
+  # CI/CD, если нужен CUDA-образ). См. ARG TORCH_INDEX_URL в Dockerfile.worker.
+  TORCH_INDEX_URL: "https://download.pytorch.org/whl/cpu"
+
+# ---------------------------------------------------------------------------
+# verify: gitleaks (секреты), gofmt (Go), ruff (Python, минимальный набор).
+# Все три — блокирующие гейты (allow_failure: false по умолчанию).
+# ---------------------------------------------------------------------------
+
+gitleaks:
+  stage: verify
+  image:
+    name: cr.home.fwz.ru/dockerhub/zricethezav/gitleaks:v8.30.1
+    entrypoint: [""]
+  variables:
+    GIT_DEPTH: "0" # полная история — сканируем все коммиты, не только последний
+  script:
+    - gitleaks detect --source="$CI_PROJECT_DIR" --redact --verbose
+
+gofmt:
+  stage: verify
+  image: cr.home.fwz.ru/dockerhub/golang:1.26.5-bookworm # go.mod требует go 1.26.5
+  script:
+    # Падаем, если есть неотформатированные .go файлы (список — в выводе ниже).
+    - gofmt -l player/ | tee gofmt-dirty.txt
+    - test ! -s gofmt-dirty.txt
+
+ruff:
+  stage: verify
+  image: cr.home.fwz.ru/dockerhub/python:3.12-slim
+  script:
+    # Минимальный набор: синтаксис (E9), невалидные префиксы строк (F63),
+    # assert в format (F7), undefined names (F82). Глубокий линт (F401 и пр.) —
+    # отдельной задачей: на текущем коде есть 5 неиспользуемых импортов.
+    - pip install --no-cache-dir "ruff==0.8.4"
+    - ruff check --select E9,F63,F7,F82 .
+
+# Гейт рассинхрона генерата (#54): schema.d.ts генерируется из
+# player/internal/api/openapi.json руками (npm run gen:api, openapi-typescript
+# пинен package-lock.json). Генерат детерминирован, поэтому любое расхождение
+# после перегенерации = openapi.json закоммичен без schema.d.ts. Diff печатается
+# в лог. Правила наследуются от workflow (MR + main + теги), как у соседей выше.
+frontend-schema:
+  stage: verify
+  # bookworm, а не slim: в slim нет git, а git diff — суть гейта.
+  image: cr.home.fwz.ru/dockerhub/node:22-bookworm # vite 8 требует node >= 22.12
+  script:
+    - cd player/frontend
+    - npm ci
+    - npm run gen:api
+    - git diff --exit-code -- src/api/schema.d.ts
+  after_script:
+    # CI_JOB_STATUS виден только в after_script — сообщение только при фейле.
+    - |
+      if [ "$CI_JOB_STATUS" != "success" ]; then
+        echo "!!! openapi.json изменён без перегенерации: запусти npm run gen:api и закоммить schema.d.ts (player/frontend/)"
+      fi
+
+# Сборка мигратора для pytest (#11). В python-образе Go нет, а Python-тесты
+# ждут УЖЕ мигрированную общую БД (conftest.py делает только TRUNCATE, DDL
+# не выполняет; воркер гейтится на goose_db_version — backend.NotMigratedError).
+# Мигратор — тот же продовый бинарь `music-hive-player migrate up` (goose,
+# embed.FS из player/migrations): единственный источник схемы, никаких
+# параллельных SQL-дампов. Артефакт скачивается pytest автоматически
+# (артефакты предыдущих стадий) и явно перечислен в его dependencies.
+migrator:
+  stage: verify
+  image: cr.home.fwz.ru/dockerhub/golang:1.26.5-bookworm # go.mod требует go 1.26.5
+  variables:
+    GOTOOLCHAIN: auto
+    GOMODCACHE: $CI_PROJECT_DIR/.go-mod-cache
+    GOCACHE: $CI_PROJECT_DIR/.gocache
+  cache:
+    key:
+      files:
+        - player/go.sum
+    paths:
+      - .go-mod-cache/
+      - .gocache/
+  script:
+    - cd player
+    - go build -o "$CI_PROJECT_DIR/bin/music-hive-player" ./cmd/music-hive-player
+  artifacts:
+    paths:
+      - bin/music-hive-player
+    expire_in: 1 day
+
+# ---------------------------------------------------------------------------
+# test: pytest (Python-воркер) и go vet + go test (плеер).
+# ---------------------------------------------------------------------------
+
+# Живой Postgres+pgvector для PG-тестов (#11): без сервиса все PG-тесты
+# молча скипаются (pgtest.EnvDSN / conftest PG_URL) — покрытие нулевое.
+# Образ и креды те же, что в docker-compose.yml (prod-parity). Executor —
+# docker: сервис доступен по hostname-алиасу `postgres`, НЕ по localhost.
+# Сервисы в GitLab per-job (создаются/удаляются вместе с джобой) — pytest и
+# go-test при параллельном прогоне получают РАЗНЫЕ postgres'ы, гонок нет.
+# Готовность БД: go-test ждёт сам (pgtest.WaitDB, ping 30s), pytest —
+# wait-лупом на psycopg (GitLab не ждёт healthcheck'ов сервисов).
+.pg-tests:
+  variables:
+    # ТЕСТОВАЯ переменная (pgtest.EnvDSN / conftest PG_URL), НЕ рабочая
+    # MUSIC_HIVE_DATABASE_URL — иначе SQLite-тесты уйдут в PG-режим.
+    MUSIC_HIVE_TEST_DATABASE_URL: postgres://music_hive:music_hive@postgres:5432/music_hive?sslmode=disable
+  services:
+    - name: cr.home.fwz.ru/dockerhub/pgvector/pgvector:pg17
+      alias: postgres
+      variables:
+        POSTGRES_USER: music_hive
+        POSTGRES_PASSWORD: music_hive
+        POSTGRES_DB: music_hive
+
+pytest:
+  stage: test
+  extends: .pg-tests
+  image: cr.home.fwz.ru/dockerhub/python:3.12-slim
+  variables:
+    UV_CACHE_DIR: $CI_PROJECT_DIR/.uv-cache
+    UV_LINK_MODE: copy
+  cache:
+    key:
+      files:
+        - uv.lock
+    paths:
+      - .uv-cache/
+  # Артефакт migrator'а — мигратор для шага goose up ниже (см. джобу migrator).
+  dependencies: [migrator]
+  before_script:
+    - pip install --no-cache-dir uv
+  script:
+    # --frozen: не пере-resolve'им, ставим строго по uv.lock.
+    # Внимание: тянет torch из lock-файла (~2-3 ГБ) — кешируется в .uv-cache.
+    - uv sync --frozen --extra dev
+    # Сервис может подниматься дольше старта джобы — ждём готовности
+    # (аналог pgtest.WaitDB). uv run python: psycopg живёт в .venv от
+    # uv sync, системного python образа он не касается.
+    - |
+      uv run python - <<'EOF'
+      import os, sys, time, psycopg
+      deadline = time.monotonic() + 30
+      while time.monotonic() < deadline:
+          try:
+              psycopg.connect(os.environ["MUSIC_HIVE_TEST_DATABASE_URL"], connect_timeout=3).close()
+              sys.exit(0)
+          except psycopg.OperationalError:
+              time.sleep(0.5)
+      sys.exit("postgres not ready in 30s")
+      EOF
+    # Схема общей тестовой БД: goose-миграции продовым мигратором (артефакт
+    # джобы migrator). Без этого — 28 ошибок UndefinedTable (relation "tracks"
+    # does not exist, пайплайн 1598). `migrate` читает MUSIC_HIVE_DATABASE_URL
+    # (main.go runMigrate) — поэтому подсовываем ему тестовый DSN; goose up
+    # идемпотентен (на актуальной БД — no-op). chmod: права exec бывают
+    # потеряны при распаковке artifacts.zip.
+    - chmod +x bin/music-hive-player
+    - MUSIC_HIVE_DATABASE_URL="$MUSIC_HIVE_TEST_DATABASE_URL" bin/music-hive-player migrate up
+    # -rs: без него причины скипов не попадают в вывод (нужны гейту ниже).
+    # pipefail: иначе tee съест код ошибки pytest.
+    - set -o pipefail && uv run pytest -q -rs 2>&1 | tee pytest.log
+    # Гейт регрессии (#11): причина скипа в выводе = env до тестов не дошла =
+    # молча потерянное PG-покрытие. grep нашёл (exit 0) → `!` роняет джобу.
+    # `!` в кавычках: без них YAML съедает ведущий `!` как признак тега.
+    - '! grep -q "не задан — PG-тесты пропущены" pytest.log'
+
+go-test:
+  stage: test
+  extends: .pg-tests
+  # Мигратор не нужен: pgtest.Open сам создаёт базу и гонит goose up
+  # (player/internal/pgtest/pgtest.go) — не качаем артефакт migrator'а.
+  dependencies: []
+  image: cr.home.fwz.ru/dockerhub/golang:1.26.5-bookworm
+  variables:
+    GOTOOLCHAIN: auto # если патч в образе < 1.26.5 — скачает нужный тулчейн
+    GOMODCACHE: $CI_PROJECT_DIR/.go-mod-cache
+    GOCACHE: $CI_PROJECT_DIR/.gocache
+  cache:
+    key:
+      files:
+        - player/go.sum
+    paths:
+      - .go-mod-cache/
+      - .gocache/
+  script:
+    - cd player
+    - go vet ./...
+    # -v: без него t.Skip-причины не печатаются, а гейт ниже ищет причину скипа.
+    # pipefail: иначе tee съест код ошибки go test.
+    - set -o pipefail && go test -v ./... 2>&1 | tee go-test.log
+    # Гейт регрессии (#11): этот skip = MUSIC_HIVE_TEST_DATABASE_URL не дошла
+    # до тестов = PG-тесты молча пропущены. grep нашёл (exit 0) → `!` роняет джобу.
+    # `!` в кавычках: без них YAML съедает ведущий `!` как признак тега.
+    - '! grep -q "skipping live PG integration" go-test.log'
+
+# ---------------------------------------------------------------------------
+# build: buildx (docker-container драйвер) --push под иммутабельный тег $CI_COMMIT_SHA.
+# Registry-кеш (--cache-from/--cache-to) нужен, т.к. dind эфемерен:
+# без него worker пересобирал бы torch-слой (~2 ГБ) на каждый пайплайн.
+# ---------------------------------------------------------------------------
+
+# HARBOR_* экспортируются интеграцией только в script-времени, поэтому
+# REGISTRY/IMAGE_REPO/PLAYER_IMAGE/WORKER_IMAGE/MODEL_SERVER_*_IMAGE считаются
+# не в variables-блоке, а джобами через !reference [.harbor-login, script].
+# CUSTOM_* — полный оверлей.
+.harbor-login:
+  script:
+    - |
+      if [ -n "${CUSTOM_REGISTRY:-}" ]; then
+        REGISTRY="$CUSTOM_REGISTRY"
+        IMAGE_REPO="${CUSTOM_IMAGE_REPO:-music-hive}"
+        REGISTRY_USER="${CUSTOM_REGISTRY_USER:?CUSTOM_REGISTRY задан, но нет CUSTOM_REGISTRY_USER}"
+        REGISTRY_PASSWORD="${CUSTOM_REGISTRY_PASSWORD:?CUSTOM_REGISTRY задан, но нет CUSTOM_REGISTRY_PASSWORD}"
+      else
+        REGISTRY="${HARBOR_HOST:?enable Harbor integration or set CUSTOM_REGISTRY*}"
+        IMAGE_REPO="${HARBOR_PROJECT:-homelab}/music-hive"
+        REGISTRY_USER="$HARBOR_USERNAME"
+        REGISTRY_PASSWORD="$HARBOR_PASSWORD"
+      fi
+      export REGISTRY IMAGE_REPO REGISTRY_USER REGISTRY_PASSWORD
+      export PLAYER_IMAGE="$REGISTRY/$IMAGE_REPO/player"
+      export WORKER_IMAGE="$REGISTRY/$IMAGE_REPO/worker"
+      # model-server (#33): матрица образов — таргеты Dockerfile model-server/
+      export MODEL_SERVER_CPU_IMAGE="$REGISTRY/$IMAGE_REPO/model-server-cpu"
+      export MODEL_SERVER_ONNX_IMAGE="$REGISTRY/$IMAGE_REPO/model-server-onnx"
+      export MODEL_SERVER_GPU_IMAGE="$REGISTRY/$IMAGE_REPO/model-server-gpu"
+
+.docker:
+  image: cr.home.fwz.ru/dockerhub/docker:27 # digest-pin после первой проверки в инфре
+  services:
+    # digest-pin verified в инфре; alias: docker обязателен (см. шапку).
+    - name: cr.home.fwz.ru/dockerhub/docker:27-dind@sha256:aa3df78ecf320f5fafdce71c659f1629e96e9de0968305fe1de670e0ca9176ce
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_TLS_VERIFY: 1
+    DOCKER_CERT_PATH: "/certs/client"
+    DOCKER_DRIVER: overlay2
+    DOCKER_BUILDKIT: 1 # Dockerfile.worker использует RUN --mount=type=cache
+    BUILDKIT_PROGRESS: plain
+  before_script:
+    - !reference [.harbor-login, script]
+    # Логин в Harbor robot-аккаунтом; password-stdin — пароль не светится в ps/логах.
+    # Если registry на приватном CA — добавьте CA в доверие dind
+    # (том /etc/docker/certs.d/$REGISTRY) или --insecure-registry=$REGISTRY.
+    - printf '%s' "$REGISTRY_PASSWORD" | docker login -u "$REGISTRY_USER" --password-stdin "$REGISTRY"
+
+# ---------------------------------------------------------------------------
+# .buildx: buildx с docker-container драйвером. Классический docker-драйвер
+# dind не умеет --cache-to type=registry («Cache export is not supported
+# for the docker driver»), поэтому build-джобы собирают через builder mhb.
+# buildx встроен в docker:27; buildkit-контейнер драйвера тянется через
+# dockerhub-зеркало Harbor как pull-through (как gitleaks/trivy).
+# ---------------------------------------------------------------------------
+.buildx:
+  script:
+    - docker buildx version
+    # dind-over-TLS: buildx create отказывается работать с DOCKER_TLS_VERIFY/
+    # DOCKER_CERT_PATH из окружения — сначала пакуем DOCKER_HOST+TLS в контекст,
+    # затем создаём builder от имени контекста (docs.gitlab.com using_buildx).
+    - docker context create mhb-ctx
+    # Если тег отсутствует в зеркале — пропиши явный путь или запинь digest.
+    - docker buildx create --name mhb --driver docker-container
+      --driver-opt image=cr.home.fwz.ru/dockerhub/moby/buildkit:buildx-stable-1 mhb-ctx --use
+
+build:player:
+  extends: .docker
+  stage: build
+  script:
+    - !reference [.buildx, script]
+    # --push заменяет отдельный docker push; scan/publish работают с registry-образами.
+    - >-
+      docker buildx build --builder mhb --push
+      --cache-from type=registry,ref="$PLAYER_IMAGE:buildcache"
+      --cache-to type=registry,ref="$PLAYER_IMAGE:buildcache",mode=max
+      -f Dockerfile.player
+      -t "$PLAYER_IMAGE:$CI_COMMIT_SHA" .
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+  allow_failure: false
+
+build:worker:
+  extends: .docker
+  stage: build
+  script:
+    - !reference [.buildx, script]
+    - >-
+      docker buildx build --builder mhb --push
+      --build-arg TORCH_INDEX_URL="$TORCH_INDEX_URL"
+      --cache-from type=registry,ref="$WORKER_IMAGE:buildcache"
+      --cache-to type=registry,ref="$WORKER_IMAGE:buildcache",mode=max
+      -f Dockerfile.worker
+      -t "$WORKER_IMAGE:$CI_COMMIT_SHA" .
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+  allow_failure: false
+
+# model-server (#33): матрица образов — таргеты одного Dockerfile
+# (model-server/Dockerfile). cpu/onnx собираются автоматом вместе с
+# player/worker; gpu — manual (heavy ~6 ГБ, собирается по необходимости).
+# onnx-образ требует примонтированные .onnx при ЗАПУСКЕ (весов в образе нет —
+# продюсируются scripts/export_*.py в корне репо, см. model-server/README.md).
+
+build:model-server-cpu:
+  extends: .docker
+  stage: build
+  script:
+    - !reference [.buildx, script]
+    - >-
+      docker buildx build --builder mhb --push
+      --build-arg TORCH_INDEX_URL="$TORCH_INDEX_URL"
+      --cache-from type=registry,ref="$MODEL_SERVER_CPU_IMAGE:buildcache"
+      --cache-to type=registry,ref="$MODEL_SERVER_CPU_IMAGE:buildcache",mode=max
+      -f model-server/Dockerfile
+      --target cpu
+      -t "$MODEL_SERVER_CPU_IMAGE:$CI_COMMIT_SHA" model-server/
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+  allow_failure: false
+
+build:model-server-onnx:
+  extends: .docker
+  stage: build
+  script:
+    - !reference [.buildx, script]
+    - >-
+      docker buildx build --builder mhb --push
+      --cache-from type=registry,ref="$MODEL_SERVER_ONNX_IMAGE:buildcache"
+      --cache-to type=registry,ref="$MODEL_SERVER_ONNX_IMAGE:buildcache",mode=max
+      -f model-server/Dockerfile
+      --target onnx
+      -t "$MODEL_SERVER_ONNX_IMAGE:$CI_COMMIT_SHA" model-server/
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+  allow_failure: false
+
+build:model-server-gpu:
+  extends: .docker
+  stage: build
+  # heavy-образ (~6 ГБ, CUDA внутри torch-вилок) — ручной запуск;
+  # TORCH_INDEX_URL в job не передаём: gpu-стадия имеет свой default cu124.
+  script:
+    - !reference [.buildx, script]
+    - >-
+      docker buildx build --builder mhb --push
+      --cache-from type=registry,ref="$MODEL_SERVER_GPU_IMAGE:buildcache"
+      --cache-to type=registry,ref="$MODEL_SERVER_GPU_IMAGE:buildcache",mode=max
+      -f model-server/Dockerfile
+      --target gpu
+      -t "$MODEL_SERVER_GPU_IMAGE:$CI_COMMIT_SHA" model-server/
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+    - if: '$CI_COMMIT_TAG'
+      when: manual
+  # manual + allow_failure: true → не блокирует пайплайн (scan/publish идут),
+  # запускается вручную пока пайплайн жив; результат не красит пайплайн.
+  allow_failure: true
+
+# ---------------------------------------------------------------------------
+# scan: trivy по образам из registry (гейт: CRITICAL/HIGH = fail).
+# Исключения — только через .trivyignore с обоснованием (issue + дата).
+# ---------------------------------------------------------------------------
+
+scan:images:
+  stage: scan
+  image:
+    name: cr.home.fwz.ru/dockerhub/aquasec/trivy:0.58.0
+    entrypoint: [""]
+  variables:
+    TRIVY_CACHE_DIR: .trivy-cache/
+    # TRIVY_INSECURE: "true"  # раскомментировать, если registry на приватном CA
+  cache:
+    key: trivy-db
+    paths:
+      - .trivy-cache/
+  script:
+    # trivy тянет образы из Harbor — авторизация через TRIVY_USERNAME/TRIVY_PASSWORD.
+    - !reference [.harbor-login, script]
+    - export TRIVY_USERNAME="$REGISTRY_USER" TRIVY_PASSWORD="$REGISTRY_PASSWORD"
+    # --ignore-unfixed: не блокируем на CVE без вышедшего фикса.
+    - |
+      scan() { trivy image --exit-code 1 --severity CRITICAL,HIGH --ignore-unfixed "$1"; }
+      # build пушит образы под иммутабельным тегом $CI_COMMIT_SHA (без :latest) —
+      # тег обязателен в каждой ссылке, иначе trivy уйдёт в :latest и NOT_FOUND.
+      scan "$PLAYER_IMAGE:$CI_COMMIT_SHA"
+      scan "$WORKER_IMAGE:$CI_COMMIT_SHA"
+      scan "$MODEL_SERVER_CPU_IMAGE:$CI_COMMIT_SHA"
+      scan "$MODEL_SERVER_ONNX_IMAGE:$CI_COMMIT_SHA"
+      # gpu собирается вручную (heavy, #33) — сканируем, только если он собран,
+      # иначе ручной пропуск build:model-server-gpu уронил бы весь scan.
+      # Probe через trivy (docker CLI в этом job нет): образ есть в registry
+      # → лёгкий json-скан проходит, нет → ошибка и пропускаем гейт-скан.
+      if trivy image --format json "$MODEL_SERVER_GPU_IMAGE:$CI_COMMIT_SHA" >/dev/null 2>&1; then
+        scan "$MODEL_SERVER_GPU_IMAGE:$CI_COMMIT_SHA"
+      else
+        echo "model-server-gpu:$CI_COMMIT_SHA не собран (manual) — скан пропущен"
+      fi
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+  allow_failure: false
+
+# ---------------------------------------------------------------------------
+# publish: навешиваем версионный тег на просканированный $CI_COMMIT_SHA.
+#   main  -> вручную (осознанная публикация dev-образа vX.Y.Z-N)
+#   тег   -> автоматически (релиз vX.Y.Z)
+# ---------------------------------------------------------------------------
+
+publish:images:
+  extends: .docker
+  stage: publish
+  resource_group: publish # защита от параллельных публикаций
+  variables:
+    GIT_DEPTH: "0" # полная история с тегами — для git describe
+  script:
+    - |
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        VERSION="$CI_COMMIT_TAG"
+      else
+        BASE="$(git describe --tags --match 'v[0-9]*' --abbrev=0 2>/dev/null \
+          || sed -n 's/^version = "\(.*\)"/v\1/p' pyproject.toml | head -1)"
+        VERSION="v${BASE#v}-${CI_PIPELINE_IID}"
+      fi
+      echo "Публикация версионного тега ${VERSION} (из ${CI_COMMIT_SHA})"
+    # retag IMAGE [optional]: 5 образов (player/worker/ms-cpu/ms-onnx/ms-gpu).
+    # optional — не падать, если heavy-сборка model-server-gpu не запускалась.
+    - |
+      retag() {
+        img="$1"
+        if [ "${2:-}" = optional ] && ! docker manifest inspect "$img:$CI_COMMIT_SHA" >/dev/null 2>&1; then
+          echo "пропуск $img — образ не собран (build:model-server-gpu manual)"
+          return 0
+        fi
+        docker pull "$img:$CI_COMMIT_SHA"
+        docker tag "$img:$CI_COMMIT_SHA" "$img:$VERSION"
+        docker push "$img:$VERSION"
+      }
+      retag "$PLAYER_IMAGE"
+      retag "$WORKER_IMAGE"
+      retag "$MODEL_SERVER_CPU_IMAGE"
+      retag "$MODEL_SERVER_ONNX_IMAGE"
+      retag "$MODEL_SERVER_GPU_IMAGE" optional
+  rules:
+    # Релизный тег — автоматом; main — ручной запуск (runner/registry могут
+    # быть ещё не готовы, а accidental-публикация на каждый push в main не нужна).
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+  allow_failure: false

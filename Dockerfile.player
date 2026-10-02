@@ -1,0 +1,42 @@
+# React-фронт (issue #48): собирается отдельной node-стадией и копируется
+# в Go-стадию перед go build, чтобы попасть в go:embed all:dist.
+#
+# WORKDIR воспроизводит структуру репозитория: build.outDir в
+# vite.config.ts относителен ("../internal/static/dist"), при
+# WORKDIR=/src/player/frontend Vite пишет в
+# /src/player/internal/static/dist, что и забирает Go-стадия.
+FROM node:22-alpine AS frontend-build
+WORKDIR /src/player/frontend
+COPY player/frontend/package.json player/frontend/package-lock.json ./
+RUN npm ci
+COPY player/frontend/ ./
+RUN npm run build
+
+# Go player (API + UI + stream)
+FROM golang:bookworm AS build
+WORKDIR /src
+ENV GOTOOLCHAIN=auto
+COPY player/go.mod player/go.sum ./
+RUN go mod download
+COPY player/ ./
+# Точечно index.html + assets/, а не весь dist/: build.outDir во
+# vite.config.ts может начать писать туда служебные файлы (.vite/
+# manifest.json, source maps и т.п.), которые go:embed all:dist включит
+# и который whitelist статики (isStaticAsset) отдаст без аутентификации.
+COPY --from=frontend-build /src/player/internal/static/dist/index.html ./internal/static/dist/index.html
+COPY --from=frontend-build /src/player/internal/static/dist/assets ./internal/static/dist/assets
+RUN CGO_ENABLED=0 go build -o /music-hive-player ./cmd/music-hive-player
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates ffmpeg \
+  && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=build /music-hive-player /usr/local/bin/music-hive-player
+ENV MUSIC_HIVE_PLAYER_ADDR=:8787 \
+    MUSIC_HIVE_WORKER_AUTOSTART=0 \
+    MUSIC_HIVE_LIBRARY=/music \
+    MUSIC_HIVE_WORKER_URL=http://worker:8790 \
+    MUSIC_HIVE_ROOT=/app
+EXPOSE 8787
+VOLUME ["/data", "/music"]
+CMD ["music-hive-player"]

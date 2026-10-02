@@ -1,0 +1,58 @@
+@import "tailwindcss";
+@source not "./ui/Showcase.tsx";
+@source not "./ui/demo.tsx";
+
+@theme {
+  --color-bg: #100c0a;
+  --color-bg2: #1a1410;
+  --color-surface: rgba(27, 21, 17, .78);
+  --color-surface-strong: rgba(30, 23, 18, .94);
+  --color-fg: #f7f0e8;
+  --color-muted: #a89888;
+  --color-accent: #e07a3a;
+  --color-accent2: #3d8f7a;
+  --color-line: #2c241c;
+  --color-line-soft: rgba(247, 240, 232, .08);
+  --color-glow: rgba(224, 122, 58, .28);
+  --font-sans: system-ui, sans-serif;
+  --font-display: system-ui, sans-serif;
+  --radius-app: 18px;
+  --shadow-app: 0 24px 70px rgba(0, 0, 0, .28);
+}
+
+html {
+  min-height: 100%;
+  background: var(--color-bg);
+  scroll-behavior: smooth;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 3px;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100%;
+  margin: 0;
+  overflow-x: hidden;
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+}
+
+button:not(:disabled), a { cursor: pointer; }
+button:disabled { cursor: wait; opacity: .65; }
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+  }
+}

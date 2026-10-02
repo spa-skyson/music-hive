@@ -1,0 +1,37 @@
+# model-server (#32): inference CLAP + MuQ-MuLan на отдельной VM.
+# Деплой и переменные — model-server/README.md. Связка с music-hive:
+#   MUSIC_HIVE_EMBEDDING_MODEL=remote:http://<vm>:8100
+#   MUSIC_HIVE_REMOTE_MODEL=clap|muq   MUSIC_HIVE_REMOTE_TOKEN=$REMOTE_TOKEN
+#
+# RAM-бюджет: обе модели fp32 в памяти ≈ 6-8 ГБ — рекомендация mem_limit: 8g
+# (compose v2 понимает mem_limit и без swarm; WORKERS>1 умножает бюджет).
+services:
+  model-server:
+    build:
+      context: ./model-server
+    image: music-hive/model-server:latest
+    ports:
+      - "0.0.0.0:8100:8100"
+    environment:
+      # fail-closed: без REMOTE_TOKEN compose сам откажется подниматься
+      REMOTE_TOKEN: ${REMOTE_TOKEN:?REMOTE_TOKEN обязателен (fail-closed)}
+      MODELS: ${MODELS:-clap,muq}
+      WORKERS: ${WORKERS:-1}
+      WARMUP: ${WARMUP:-1}
+      MAX_BODY_MB: ${MAX_BODY_MB:-100}
+      DECODE_TIMEOUT: ${DECODE_TIMEOUT:-120}
+    volumes:
+      # кеш весов HF (~3 ГБ: CLAP ~600М + MuQ-MuLan ~2.8Г fp32) между рестартами;
+      # внутри контейнера HF_HOME=/cache/hf (non-root пользователь modelsrv)
+      - model-server-hf:/cache/hf
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    # mem_limit: 8g  # рекомендация: обе модели fp32 ≈ 6-8 ГБ RAM
+
+volumes:
+  model-server-hf:

@@ -1,0 +1,13 @@
+{
+  "path": "clap-reference.onnx",
+  "sample_rate": 48000,
+  "window_sec": 30.0,
+  "hop_sec": 30.0,
+  "input_name": "input_features",
+  "output_name": "embedding",
+  "input_kind": "log_mel",
+  "feature_extractor": "laion/larger_clap_music_and_speech",
+  "aggregate": "mean",
+  "batch_size": 1,
+  "dim": 512
+}
