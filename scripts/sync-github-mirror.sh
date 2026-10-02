@@ -10,7 +10,20 @@
 #
 # Environment:
 #   MIRROR_REMOTE  git remote pointing to the public mirror (default: github)
+#   GIT_AUTHOR_*   override the publication identity (author name/email); the
+#                  committer always follows the author, a direct GIT_COMMITTER_*
+#                  override is not supported. By default snapshots use the
+#                  account's noreply address so that email privacy restrictions
+#                  on the hosting side never reject a push
 set -euo pipefail
+
+# GitHub rejects pushes that expose a private email, so publication commits
+# default to the account's noreply identity. Override via environment
+# (GIT_AUTHOR_*); the committer always follows the author.
+MIRROR_AUTHOR_NAME="${GIT_AUTHOR_NAME:-Alexander Gazal}"
+MIRROR_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-88609358+spa-skyson@users.noreply.github.com}"
+export GIT_AUTHOR_NAME="$MIRROR_AUTHOR_NAME" GIT_AUTHOR_EMAIL="$MIRROR_AUTHOR_EMAIL"
+export GIT_COMMITTER_NAME="$MIRROR_AUTHOR_NAME" GIT_COMMITTER_EMAIL="$MIRROR_AUTHOR_EMAIL"
 
 REF="${1:-main}"
 MIRROR_REMOTE="${MIRROR_REMOTE:-github}"
